@@ -1,10 +1,10 @@
 use std::env;
-use std::process::Command;
-use std::os::unix::process::CommandExt;
-use std::os::unix::net::UnixStream;
 use std::io;
+use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
+use std::process::Command;
 
-use rmp::{encode as enc, decode as dec};
+use rmp::{decode as dec, encode as enc};
 
 fn main() -> anyhow::Result<()> {
     let val = env::var("NVIM_LISTEN_ADDRESS").ok();
@@ -17,28 +17,33 @@ fn main() -> anyhow::Result<()> {
                 println!("renvim v0.0.0 -- Neovim wrapper.\n")
             }
         }
-        return Err(Command::new("nvim")
-            .args(args)
-            .exec()
-            .into());
+        return Err(Command::new("nvim").args(args).exec().into());
     }
 
     let mut conn = UnixStream::connect(val.unwrap())?;
 
-    fn tabnew<W>(conn: &mut W, file: Option<String>) -> anyhow::Result<()> where W: io::Write {
+    fn tabnew<W>(conn: &mut W, file: Option<String>) -> anyhow::Result<()>
+    where
+        W: io::Write,
+    {
         enc::write_array_len(conn, 4)?;
         enc::write_u8(conn, 0)?;
         enc::write_u32(conn, 0)?;
         enc::write_str(conn, "nvim_command")?;
 
-        let command = file.map(|f| format!("tabnew {}", f)).unwrap_or("tabnew".into());
+        let command = file
+            .map(|f| format!("tabnew {}", f))
+            .unwrap_or("tabnew".into());
         enc::write_array_len(conn, 1)?;
         enc::write_str(conn, &command)?;
 
         anyhow::Result::<_>::Ok(())
     }
 
-    fn recv<R>(conn: &mut R) -> anyhow::Result<()> where R: io::Read {
+    fn recv<R>(conn: &mut R) -> anyhow::Result<()>
+    where
+        R: io::Read,
+    {
         match dec::read_array_len(conn)? {
             4 => {}
             x => anyhow::bail!("unexpected array len. {}", x),
