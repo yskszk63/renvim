@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/mattn/go-isatty"
@@ -60,9 +61,27 @@ func main() {
 		args = []string{"-"}
 	}
 
-	for _, a := range args {
+	var wg sync.WaitGroup
+	exited := make(map[uint]bool)
+	if err := client.RegisterHandler("renvimExit", func(idx uint) {
+		_, found := exited[idx]
+		if !found {
+			exited[idx] = true
+			wg.Done()
+		}
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to register handler: %s\n", err)
+		os.Exit(-1)
+	}
+	if err := client.Subscribe("renvimExit"); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to register handler: %s\n", err)
+		os.Exit(-1)
+	}
+
+	for idx, a := range args {
 		if strings.HasPrefix(a, "--") {
 			fmt.Fprintf(os.Stderr, "Ignore option %s\n", a)
+			continue
 		}
 
 		if a == "-" {
@@ -91,11 +110,6 @@ func main() {
 				}
 			}
 
-			if err := client.Command("silent 1delete _"); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to open file: %s\n", err)
-				os.Exit(-1)
-			}
-
 		} else {
 			p, err := filepath.Abs(a)
 			if err != nil {
@@ -107,5 +121,21 @@ func main() {
 				fmt.Fprintf(os.Stderr, "failed to open file %s: %s\n", p, err)
 			}
 		}
+
+		ch := client.ChannelID()
+		c := fmt.Sprintf(`augroup renvim
+autocmd BufDelete <buffer> silent! call rpcnotify(%[1]d, "renvimExit", %[2]d)
+autocmd BufWinLeave <buffer> silent! call rpcnotify(%[1]d, "renvimExit", %[2]d)
+augroup END
+`, ch, idx)
+
+		if _, err := client.Exec(c, false); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to regeister autocmd: %s", err)
+			os.Exit(-1)
+		}
+
+		wg.Add(1)
 	}
+
+	wg.Wait()
 }
