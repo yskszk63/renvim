@@ -1,15 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 
-	"github.com/vmihailenco/msgpack/v5"
+	"github.com/mattn/go-isatty"
+	"github.com/neovim/go-client/nvim"
 )
 
 func main() {
@@ -48,107 +49,62 @@ func main() {
 		}
 	}
 
-	conn, err := net.Dial("unix", val)
+	client, err := nvim.Dial(val)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to connect %s: %s\n", val, err)
+		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(-1)
 	}
-	defer conn.Close()
-
-	enc := msgpack.NewEncoder(conn)
-	dec := msgpack.NewDecoder(conn)
-
-	tabnew := func(file *string) error {
-		// msgpack-rpc request
-		// [type, msgid, method, params]
-
-		if err := enc.EncodeArrayLen(4); err != nil {
-			return err
-		}
-		if err := enc.EncodeUint8(0); err != nil {
-			return err
-		}
-		if err := enc.EncodeUint32(0); err != nil {
-			return err
-		}
-		if err := enc.EncodeString("nvim_command"); err != nil {
-			return err
-		}
-
-		var command string
-		if file != nil {
-			command = fmt.Sprintf("tabnew %s", *file)
-		} else {
-			command = "tabnew"
-		}
-
-		if err := enc.EncodeArrayLen(1); err != nil {
-			return err
-		}
-		if err := enc.EncodeString(command); err != nil {
-			return err
-		}
-
-		return nil
-	}
-
-	recv := func() error {
-		// msgpack-rpc response
-		// [type, msgid, error, result]
-
-		alen, err := dec.DecodeArrayLen()
-		if err != nil {
-			return err
-		}
-		if alen != 4 {
-			return fmt.Errorf("unexpected array len %d", alen)
-		}
-
-		_, err = dec.DecodeInt()
-		if err != nil {
-			return err
-		}
-
-		_, err = dec.DecodeInt()
-		if err != nil {
-			return nil
-		}
-
-		arglen, err := dec.DecodeArrayLen()
-		if err != nil {
-			return err
-		}
-		if arglen != -1 {
-			return fmt.Errorf("unexpected array len %d", arglen)
-		}
-
-		return nil
-	}
+	defer client.Close()
 
 	if len(args) == 0 {
-		if err := tabnew(nil); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to open file %s: %s\n", val, err)
-		}
-		if err := recv(); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to open file %s: %s\n", val, err)
+		args = []string{"-"}
+	}
+
+	for _, a := range args {
+		if strings.HasPrefix(a, "--") {
+			fmt.Fprintf(os.Stderr, "Ignore option %s\n", a)
 		}
 
-	} else {
-		for _, a := range args {
-			if strings.HasPrefix(a, "--") {
-				fmt.Fprintf(os.Stderr, "Ignore option %s\n", a)
+		if a == "-" {
+			if err := client.Command("tabnew"); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to open file: %s\n", err)
+				os.Exit(-1)
 			}
 
+			if !isatty.IsTerminal(os.Stdin.Fd()) {
+				buf, err := client.CurrentBuffer()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "failed to get current buffer: %s\n", err)
+					os.Exit(-1)
+				}
+
+				sc := bufio.NewScanner(os.Stdin)
+				for sc.Scan() {
+					if err := client.SetBufferLines(buf, -2, -2, false, [][]byte{[]byte(sc.Text())}); err != nil {
+						fmt.Fprintf(os.Stderr, "failed to get set buffer lines: %s\n", err)
+						os.Exit(-1)
+					}
+				}
+				if err := sc.Err(); err != nil {
+					fmt.Fprintf(os.Stderr, "failed to get current buffer: %s\n", err)
+					os.Exit(-1)
+				}
+			}
+
+			if err := client.Command("silent 1delete _"); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to open file: %s\n", err)
+				os.Exit(-1)
+			}
+
+		} else {
 			p, err := filepath.Abs(a)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "failed to resolve file %s: %s\n", val, err)
+				fmt.Fprintf(os.Stderr, "failed to resolve file %s: %s\n", p, err)
 				p = a
 			}
-			if err := tabnew(&p); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to open file %s: %s\n", val, err)
-			}
-			if err := recv(); err != nil {
-				fmt.Fprintf(os.Stderr, "failed to open file %s: %s\n", val, err)
+			command := fmt.Sprintf("tabnew %s", p)
+			if err := client.Command(command); err != nil {
+				fmt.Fprintf(os.Stderr, "failed to open file %s: %s\n", p, err)
 			}
 		}
 	}
