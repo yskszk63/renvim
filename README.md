@@ -12,6 +12,28 @@ I made it because I don't like the nested Neovim to start in Neovim's Terminal.
 
 ![nested](assets/nested.png)
 
+## Example
+
+Launch nvim and pass args If outside Neovim Terminal.
+
+```bash
+$ renvim file.txt
+```
+
+as Git commit message editor.
+
+```bash
+$ EDITOR=renvim git commit
+```
+
+.bashrc or .zsh alias
+
+```bash
+export EDITOR=renvim
+alias nvim=$EDITOR
+# or alias vi=$EDITOR
+```
+
 ## License
 
 Licensed under either of
