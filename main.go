@@ -73,6 +73,26 @@ augroup END`)
 }
 
 func tabnew(client *nvim.Nvim, stdin *os.File) (*nvim.Buffer, error) {
+	tty := isatty.IsTerminal(stdin.Fd())
+
+	if !tty {
+		// may be not work on mac.
+		proc, err := filepath.EvalSymlinks("/proc/self")
+		if err == nil {
+			fd := filepath.Join(proc, "fd", "0")
+			buf, err := tabnew_with_file(client, fd)
+			if err != nil {
+				return nil, err
+			}
+
+			if err := client.Command("silent! 0file"); err != nil {
+				return nil, err
+			}
+
+			return buf, nil
+		}
+	}
+
 	if err := client.Command("tabnew"); err != nil {
 		return nil, fmt.Errorf("failed to open file: %s", err)
 	}
@@ -82,7 +102,7 @@ func tabnew(client *nvim.Nvim, stdin *os.File) (*nvim.Buffer, error) {
 		return nil, fmt.Errorf("failed to get current buffer: %s", err)
 	}
 
-	if !isatty.IsTerminal(stdin.Fd()) {
+	if !tty {
 		sc := bufio.NewScanner(stdin)
 		for sc.Scan() {
 			if err := client.SetBufferLines(buf, -2, -2, false, [][]byte{[]byte(sc.Text())}); err != nil {
