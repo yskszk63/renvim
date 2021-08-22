@@ -23,7 +23,7 @@ func optonly(args []string) bool {
 	return true
 }
 
-func exec_as_nvim(args []string) error {
+func execAsNvim(args []string) error {
 	bin, err := exec.LookPath("nvim")
 	if err != nil {
 		return fmt.Errorf("no nvim found: %s\n", err)
@@ -46,7 +46,7 @@ func exec_as_nvim(args []string) error {
 	return nil
 }
 
-func prepare_env(client *nvim.Nvim, opened map[int]bool, wg *sync.WaitGroup) error {
+func prepareEnv(client *nvim.Nvim, opened map[int]bool, wg *sync.WaitGroup) error {
 	if err := client.RegisterHandler("renvimExit", func(buf int) {
 		//fmt.Printf("OK %d %v\n", buf, opened)
 
@@ -80,7 +80,7 @@ func tabnew(client *nvim.Nvim, stdin *os.File) (*nvim.Buffer, error) {
 		proc, err := filepath.EvalSymlinks("/proc/self")
 		if err == nil {
 			fd := filepath.Join(proc, "fd", "0")
-			buf, err := tabnew_with_file(client, fd)
+			buf, err := tabnewWithFile(client, fd)
 			if err != nil {
 				return nil, err
 			}
@@ -117,7 +117,7 @@ func tabnew(client *nvim.Nvim, stdin *os.File) (*nvim.Buffer, error) {
 	return &buf, nil
 }
 
-func tabnew_with_file(client *nvim.Nvim, file string) (*nvim.Buffer, error) {
+func tabnewWithFile(client *nvim.Nvim, file string) (*nvim.Buffer, error) {
 	p, err := filepath.Abs(file)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to resolve file %s: %s\n", p, err)
@@ -141,7 +141,7 @@ func main() {
 	args := os.Args[1:]
 
 	if !present || val == "" || (len(args) > 0 && optonly(args)) {
-		if err := exec_as_nvim(args); err != nil {
+		if err := execAsNvim(args); err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
 			os.Exit(-1)
 		}
@@ -160,7 +160,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	opened := make(map[int]bool)
-	if err := prepare_env(client, opened, &wg); err != nil {
+	if err := prepareEnv(client, opened, &wg); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(-1)
 	}
@@ -181,7 +181,7 @@ func main() {
 			wg.Add(1)
 
 		} else {
-			buf, err := tabnew_with_file(client, a)
+			buf, err := tabnewWithFile(client, a)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%s\n", err)
 				os.Exit(-1)
