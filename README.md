@@ -2,6 +2,7 @@
 
 [![Go Report Card](https://goreportcard.com/badge/github.com/yskszk63/renvim)](https://goreportcard.com/report/github.com/yskszk63/renvim)
 
+Outside Neovim aware Neovim launcher.
 Open the file in the outer Neovim instance.
 
 ## Demo
