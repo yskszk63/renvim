@@ -14,6 +14,37 @@ import (
 	"github.com/neovim/go-client/nvim"
 )
 
+type nvimClient interface {
+	RegisterHandler(method string, fn interface{}) error
+	Subscribe(event string) error
+	Exec(src string, output bool) (string, error)
+	Command(command string) error
+	CurrentBuffer() (nvim.Buffer, error)
+	SetBufferLines(nvim.Buffer, int, int, bool, [][]byte) error
+}
+
+type buffers struct {
+	buffers map[int]bool
+	fndone  func()
+	fnadd   func(int)
+}
+
+func (e *buffers) add(buf int) {
+	_, found := e.buffers[buf]
+	if !found {
+		e.buffers[buf] = false
+		e.fnadd(1)
+	}
+}
+
+func (e *buffers) done(buf int) {
+	v, found := e.buffers[buf]
+	if !v && found {
+		e.buffers[buf] = true
+		e.fndone()
+	}
+}
+
 func optonly(args []string) bool {
 	for _, a := range args {
 		if !strings.HasPrefix(a, "--") {
@@ -23,7 +54,7 @@ func optonly(args []string) bool {
 	return true
 }
 
-func execAsNvim(args []string) error {
+func execAsNvim(args []string, fnexec func(string, []string, []string) error) error {
 	bin, err := exec.LookPath("nvim")
 	if err != nil {
 		return fmt.Errorf("no nvim found: %s\n", err)
@@ -34,52 +65,38 @@ func execAsNvim(args []string) error {
 
 	env := os.Environ()
 
-	for _, a := range args {
-		if a == "--version" {
-			fmt.Printf("renvim v0.0.0 -- Neovim wrapper.\n\n") // FIXME version
-		}
-	}
-
-	if err := syscall.Exec(bin, newargs, env); err != nil {
+	if err := fnexec(bin, newargs, env); err != nil {
 		return fmt.Errorf("failed to exec nvim: %s\n", err)
 	}
 	return nil
 }
 
-func prepareEnv(client *nvim.Nvim, opened map[int]bool, wg *sync.WaitGroup) error {
-	if err := client.RegisterHandler("renvimExit", func(buf int) {
-		//fmt.Printf("OK %d %v\n", buf, opened)
-
-		closed, found := opened[buf]
-		if !closed && found {
-			opened[buf] = true
-			wg.Done()
-		}
-	}); err != nil {
+func prepareEnv(client nvimClient, b *buffers) error {
+	if err := client.RegisterHandler("renvimExit", b.done); err != nil {
 		return fmt.Errorf("failed to register handler: %s", err)
 	}
 	if err := client.Subscribe("renvimExit"); err != nil {
-		return fmt.Errorf("failed to register handler: %s", err)
+		return fmt.Errorf("failed to subscribe: %s", err)
 	}
 
 	c := fmt.Sprintf(`augroup renvim
 autocmd! BufWinLeave * silent! call rpcnotify(0, "renvimExit", str2nr(expand("<abuf>")))
 augroup END`)
 	if _, err := client.Exec(c, false); err != nil {
-		return fmt.Errorf("failed to regeister autocmd: %s", err)
+		return fmt.Errorf("failed to register autocmd: %s", err)
 	}
 
 	return nil
 }
 
-func tabnew(client *nvim.Nvim, stdin *os.File) (*nvim.Buffer, error) {
+func tabnew(client nvimClient, stdin *os.File) (*nvim.Buffer, error) {
 	tty := isatty.IsTerminal(stdin.Fd())
 
 	if !tty {
 		// may be not work on mac.
 		proc, err := filepath.EvalSymlinks("/proc/self")
 		if err == nil {
-			fd := filepath.Join(proc, "fd", "0")
+			fd := filepath.Join(proc, "fd", fmt.Sprint(stdin.Fd()))
 			buf, err := tabnewWithFile(client, fd)
 			if err != nil {
 				return nil, err
@@ -117,7 +134,7 @@ func tabnew(client *nvim.Nvim, stdin *os.File) (*nvim.Buffer, error) {
 	return &buf, nil
 }
 
-func tabnewWithFile(client *nvim.Nvim, file string) (*nvim.Buffer, error) {
+func tabnewWithFile(client nvimClient, file string) (*nvim.Buffer, error) {
 	p, err := filepath.Abs(file)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to resolve file %s: %s\n", p, err)
@@ -141,7 +158,13 @@ func main() {
 	args := os.Args[1:]
 
 	if !present || val == "" || (len(args) > 0 && optonly(args)) {
-		if err := execAsNvim(args); err != nil {
+		for _, a := range args {
+			if a == "--version" {
+				fmt.Printf("renvim v0.0.0 -- Neovim wrapper.\n\n") // FIXME version
+			}
+		}
+
+		if err := execAsNvim(args, syscall.Exec); err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
 			os.Exit(-1)
 		}
@@ -160,7 +183,13 @@ func main() {
 
 	var wg sync.WaitGroup
 	opened := make(map[int]bool)
-	if err := prepareEnv(client, opened, &wg); err != nil {
+	b := &buffers{
+		buffers: opened,
+		fnadd:   wg.Add,
+		fndone:  wg.Done,
+	}
+
+	if err := prepareEnv(client, b); err != nil {
 		fmt.Fprintf(os.Stderr, "%s\n", err)
 		os.Exit(-1)
 	}
@@ -177,8 +206,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "%s\n", err)
 				os.Exit(-1)
 			}
-			opened[int(*buf)] = false
-			wg.Add(1)
+			b.add(int(*buf))
 
 		} else {
 			buf, err := tabnewWithFile(client, a)
@@ -186,8 +214,7 @@ func main() {
 				fmt.Fprintf(os.Stderr, "%s\n", err)
 				os.Exit(-1)
 			}
-			opened[int(*buf)] = false
-			wg.Add(1)
+			b.add(int(*buf))
 
 		}
 	}
