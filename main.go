@@ -153,17 +153,20 @@ func tabnewWithFile(client nvimClient, file string) (*nvim.Buffer, error) {
 	return &buf, nil
 }
 
+func printVersionIfVersionExists(args []string) {
+	for _, a := range args {
+		if a == "--version" {
+			fmt.Printf("renvim v0.0.0 -- Neovim wrapper.\n\n") // FIXME version
+		}
+	}
+}
+
 func main() {
 	val, present := os.LookupEnv("NVIM_LISTEN_ADDRESS")
 	args := os.Args[1:]
 
 	if !present || val == "" || (len(args) > 0 && optonly(args)) {
-		for _, a := range args {
-			if a == "--version" {
-				fmt.Printf("renvim v0.0.0 -- Neovim wrapper.\n\n") // FIXME version
-			}
-		}
-
+		printVersionIfVersionExists(args)
 		if err := execAsNvim(args, syscall.Exec); err != nil {
 			fmt.Fprintf(os.Stderr, "%s\n", err)
 			os.Exit(-1)
