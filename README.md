@@ -38,6 +38,16 @@ alias nvim=$EDITOR
 # or alias vi=$EDITOR
 ```
 
+## Install
+
+[Download](https://github.com/yskszk63/renvim/releases/latest)
+
+or
+
+```
+paru -S renvim-bin
+```
+
 ## License
 
 Licensed under either of
