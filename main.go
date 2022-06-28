@@ -162,7 +162,7 @@ func printVersionIfVersionExists(args []string) {
 }
 
 func main() {
-	val, present := os.LookupEnv("NVIM_LISTEN_ADDRESS")
+	val, present := os.LookupEnv("NVIM")
 	args := os.Args[1:]
 
 	if !present || val == "" || (len(args) > 0 && optonly(args)) {
