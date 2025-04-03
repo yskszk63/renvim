@@ -2,9 +2,11 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -15,34 +17,14 @@ import (
 )
 
 type nvimClient interface {
-	RegisterHandler(method string, fn interface{}) error
+	RegisterHandler(method string, fn any) error
 	Subscribe(event string) error
-	Exec(src string, output bool) (string, error)
+	Unsubscribe(event string) error
 	Command(command string) error
 	CurrentBuffer() (nvim.Buffer, error)
 	SetBufferLines(nvim.Buffer, int, int, bool, [][]byte) error
-}
-
-type buffers struct {
-	buffers map[int]bool
-	fndone  func()
-	fnadd   func(int)
-}
-
-func (e *buffers) add(buf int) {
-	_, found := e.buffers[buf]
-	if !found {
-		e.buffers[buf] = false
-		e.fnadd(1)
-	}
-}
-
-func (e *buffers) done(buf int) {
-	v, found := e.buffers[buf]
-	if !v && found {
-		e.buffers[buf] = true
-		e.fndone()
-	}
+	ChannelID() int
+	ExecLua(code string, result any, args ...any) error
 }
 
 func optonly(args []string) bool {
@@ -57,7 +39,7 @@ func optonly(args []string) bool {
 func execAsNvim(args []string, fnexec func(string, []string, []string) error) error {
 	bin, err := exec.LookPath("nvim")
 	if err != nil {
-		return fmt.Errorf("no nvim found: %s\n", err)
+		return fmt.Errorf("no nvim found: %w", err)
 	}
 	newargs := make([]string, len(args)+1)
 	copy(newargs[1:], args)
@@ -66,30 +48,70 @@ func execAsNvim(args []string, fnexec func(string, []string, []string) error) er
 	env := os.Environ()
 
 	if err := fnexec(bin, newargs, env); err != nil {
-		return fmt.Errorf("failed to exec nvim: %s\n", err)
+		return fmt.Errorf("failed to exec nvim: %w", err)
 	}
 	return nil
 }
 
-func prepareEnv(client nvimClient, b *buffers) error {
-	if err := client.RegisterHandler("renvimExit", b.done); err != nil {
-		return fmt.Errorf("failed to register handler: %s", err)
+func prepareEnv(cx context.Context, wg *sync.WaitGroup, client nvimClient, bufwg *sync.WaitGroup) error {
+	fn := func() {
+		bufwg.Done()
+	}
+	if err := client.RegisterHandler("renvimExit", fn); err != nil {
+		return fmt.Errorf("failed to register handler: %w", err)
 	}
 	if err := client.Subscribe("renvimExit"); err != nil {
-		return fmt.Errorf("failed to subscribe: %s", err)
+		return fmt.Errorf("failed to subscribe: %w", err)
 	}
 
-	c := fmt.Sprintf(`augroup renvim
-autocmd! BufWinLeave * silent! call rpcnotify(0, "renvimExit", str2nr(expand("<abuf>")))
-augroup END`)
-	if _, err := client.Exec(c, false); err != nil {
-		return fmt.Errorf("failed to register autocmd: %s", err)
-	}
+	wg.Add(1)
+	context.AfterFunc(cx, func() {
+		defer wg.Done()
+
+		if err := client.Unsubscribe("renvimExit"); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to unsubscribe: %s\n", err)
+		}
+	})
 
 	return nil
 }
 
-func tabnew(client nvimClient, stdin *os.File) (*nvim.Buffer, error) {
+func registerCloseNotify(cx context.Context, wg *sync.WaitGroup, client nvimClient, bufwg *sync.WaitGroup) error {
+	cid := client.ChannelID()
+
+	code := fmt.Sprintf(`return vim.api.nvim_create_autocmd('BufWinLeave', {
+  buffer = bufnr,
+  callback = function(e)
+    vim.rpcnotify(%d, 'renvimExit')
+  end,
+})`, cid)
+
+	var id int
+	var args struct{}
+
+	if err := client.ExecLua(code, &id, &args); err != nil {
+		return err
+	}
+	bufwg.Add(1)
+
+	wg.Add(1)
+	context.AfterFunc(cx, func() {
+		defer wg.Done()
+
+		code := fmt.Sprintf(`return vim.api.nvim_del_autocmd(%d)`, id)
+
+		var result any
+		var args struct{}
+
+		if err := client.ExecLua(code, &result, &args); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		}
+	})
+
+	return nil
+}
+
+func tabnew(cx context.Context, wg *sync.WaitGroup, client nvimClient, stdin *os.File, bufwg *sync.WaitGroup) error {
 	tty := isatty.IsTerminal(stdin.Fd())
 
 	if !tty {
@@ -97,44 +119,47 @@ func tabnew(client nvimClient, stdin *os.File) (*nvim.Buffer, error) {
 		proc, err := filepath.EvalSymlinks("/proc/self")
 		if err == nil {
 			fd := filepath.Join(proc, "fd", fmt.Sprint(stdin.Fd()))
-			buf, err := tabnewWithFile(client, fd)
-			if err != nil {
-				return nil, err
+			if err := tabnewWithFile(cx, wg, client, fd, bufwg); err != nil {
+				return err
 			}
 
 			if err := client.Command("silent! 0file"); err != nil {
-				return nil, err
+				return err
 			}
 
-			return buf, nil
+			return nil
 		}
 	}
 
 	if err := client.Command("tabnew"); err != nil {
-		return nil, fmt.Errorf("failed to open file: %s", err)
+		return fmt.Errorf("failed to open file: %s", err)
 	}
 
-	buf, err := client.CurrentBuffer()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current buffer: %s", err)
+	if err := registerCloseNotify(cx, wg, client, bufwg); err != nil {
+		return err
 	}
 
 	if !tty {
+		buf, err := client.CurrentBuffer()
+		if err != nil {
+			return fmt.Errorf("failed to get current buffer: %s", err)
+		}
+
 		sc := bufio.NewScanner(stdin)
 		for sc.Scan() {
-			if err := client.SetBufferLines(buf, -2, -2, false, [][]byte{[]byte(sc.Text())}); err != nil {
-				return nil, fmt.Errorf("failed to get set buffer lines: %s", err)
+			if err := client.SetBufferLines(buf, -2, -2, false, [][]byte{sc.Bytes()}); err != nil {
+				return fmt.Errorf("failed to get set buffer lines: %s", err)
 			}
 		}
 		if err := sc.Err(); err != nil {
-			return nil, fmt.Errorf("failed to get current buffer: %s", err)
+			return fmt.Errorf("failed to get current buffer: %s", err)
 		}
 	}
 
-	return &buf, nil
+	return nil
 }
 
-func tabnewWithFile(client nvimClient, file string) (*nvim.Buffer, error) {
+func tabnewWithFile(cx context.Context, wg *sync.WaitGroup, client nvimClient, file string, bufwg *sync.WaitGroup) error {
 	p, err := filepath.Abs(file)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "failed to resolve file %s: %s\n", p, err)
@@ -142,15 +167,14 @@ func tabnewWithFile(client nvimClient, file string) (*nvim.Buffer, error) {
 	}
 	command := fmt.Sprintf("tabnew %s", p)
 	if err := client.Command(command); err != nil {
-		return nil, fmt.Errorf("failed to open file %s: %s", p, err)
+		return fmt.Errorf("failed to open file %s: %s", p, err)
 	}
 
-	buf, err := client.CurrentBuffer()
-	if err != nil {
-		return nil, fmt.Errorf("failed to get current buffer: %s", err)
+	if err := registerCloseNotify(cx, wg, client, bufwg); err != nil {
+		return err
 	}
 
-	return &buf, nil
+	return nil
 }
 
 func printVersionIfVersionExists(args []string) {
@@ -161,22 +185,20 @@ func printVersionIfVersionExists(args []string) {
 	}
 }
 
-func main() {
+func run() error {
 	val, present := os.LookupEnv("NVIM")
 	args := os.Args[1:]
 
 	if !present || val == "" || (len(args) > 0 && optonly(args)) {
 		printVersionIfVersionExists(args)
 		if err := execAsNvim(args, syscall.Exec); err != nil {
-			fmt.Fprintf(os.Stderr, "%s\n", err)
-			os.Exit(-1)
+			return err
 		}
 	}
 
 	client, err := nvim.Dial(val)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", err)
-		os.Exit(-1)
+		return err
 	}
 	defer client.Close()
 
@@ -184,17 +206,18 @@ func main() {
 		args = []string{"-"}
 	}
 
-	var wg sync.WaitGroup
-	opened := make(map[int]bool)
-	b := &buffers{
-		buffers: opened,
-		fnadd:   wg.Add,
-		fndone:  wg.Done,
-	}
+	// WaitGroup for context done.
+	wg := &sync.WaitGroup{}
+	defer wg.Wait()
 
-	if err := prepareEnv(client, b); err != nil {
-		fmt.Fprintf(os.Stderr, "%s\n", err)
-		os.Exit(-1)
+	cx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	// WaitGroup for buffers done.
+	bufwg := &sync.WaitGroup{}
+
+	if err := prepareEnv(cx, wg, client, bufwg); err != nil {
+		return err
 	}
 
 	for _, a := range args {
@@ -204,23 +227,29 @@ func main() {
 		}
 
 		if a == "-" {
-			buf, err := tabnew(client, os.Stdin)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%s\n", err)
-				os.Exit(-1)
+			if err := tabnew(cx, wg, client, os.Stdin, bufwg); err != nil {
+				return err
 			}
-			b.add(int(*buf))
 
 		} else {
-			buf, err := tabnewWithFile(client, a)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%s\n", err)
-				os.Exit(-1)
+			if err := tabnewWithFile(cx, wg, client, a, bufwg); err != nil {
+				return err
 			}
-			b.add(int(*buf))
-
 		}
 	}
 
-	wg.Wait()
+	go func() {
+		bufwg.Wait()
+		cancel()
+	}()
+
+	<-cx.Done()
+	return nil
+}
+
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(-1)
+	}
 }

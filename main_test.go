@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/creack/pty"
@@ -52,7 +53,7 @@ func TestExecAsNvim(t *testing.T) {
 		{"testdata/nvim_exists", []string{}, fail, p("failed to exec nvim: err")},
 		{"testdata/nvim_exists", []string{"foo", "bar"}, func(bin string, args, env []string) error {
 			bin, err := filepath.Abs("testdata/nvim_exists/nvim")
-			if err != nil || (err == nil && bin != bin) {
+			if err != nil || bin != bin {
 				t.Fail()
 			}
 
@@ -86,53 +87,8 @@ func TestExecAsNvim(t *testing.T) {
 	}
 }
 
-func TestBuffers(t *testing.T) {
-	tests := []struct {
-		add             []int
-		done            []int
-		wantsAddCalled  int
-		wantsDoneCalled int
-	}{
-		{[]int{0}, []int{0}, 1, 1},
-		{[]int{0}, []int{1}, 1, 0},
-		{[]int{0, 0}, []int{0}, 1, 1},
-		{[]int{0, 0}, []int{0, 0}, 1, 1},
-	}
-
-	for _, test := range tests {
-		addCalled := 0
-		doneCalled := 0
-		b := buffers{
-			buffers: make(map[int]bool),
-			fnadd: func(n int) {
-				if n != 1 {
-					t.Fail()
-				}
-				addCalled += 1
-			},
-			fndone: func() {
-				doneCalled += 1
-			},
-		}
-
-		for _, a := range test.add {
-			b.add(a)
-		}
-		for _, d := range test.done {
-			b.done(d)
-		}
-
-		if !reflect.DeepEqual(test.wantsAddCalled, addCalled) {
-			t.Fatalf("wants %v, but %v", test.wantsAddCalled, addCalled)
-		}
-		if test.wantsDoneCalled != doneCalled {
-			t.Fatalf("wants %v, but %v", test.wantsDoneCalled, doneCalled)
-		}
-	}
-}
-
 type testClient struct {
-	fnRegisterHandler func(string, interface{}) error
+	fnRegisterHandler func(string, any) error
 	fnSubscribe       func(string) error
 	fnExec            func(string, bool) (string, error)
 	fnCommand         func(string) error
@@ -140,7 +96,7 @@ type testClient struct {
 	fnSetBufferLines  func(nvim.Buffer, int, int, bool, [][]byte) error
 }
 
-func (t *testClient) RegisterHandler(method string, fn interface{}) error {
+func (t *testClient) RegisterHandler(method string, fn any) error {
 	return t.fnRegisterHandler(method, fn)
 }
 func (t *testClient) Subscribe(event string) error {
@@ -158,6 +114,15 @@ func (t *testClient) CurrentBuffer() (nvim.Buffer, error) {
 func (t *testClient) SetBufferLines(buf nvim.Buffer, start, end int, strict bool, lines [][]byte) error {
 	return t.SetBufferLines(buf, start, end, strict, lines)
 }
+func (t *testClient) ChannelID() int {
+	return 3
+}
+func (t *testClient) ExecLua(code string, result any, args ...any) error {
+	return nil
+}
+func (t *testClient) Unsubscribe(event string) error {
+	return nil
+}
 
 func TestPrepareEnv(t *testing.T) {
 	tests := []struct {
@@ -169,29 +134,30 @@ func TestPrepareEnv(t *testing.T) {
 		{nil, nil, nil, nil},
 		{fmt.Errorf("err"), nil, nil, p("failed to register handler: err")},
 		{nil, fmt.Errorf("err"), nil, p("failed to subscribe: err")},
-		{nil, nil, fmt.Errorf("err"), p("failed to register autocmd: err")},
 	}
 
-	for _, test := range tests {
-		client := &testClient{
-			fnRegisterHandler: func(method string, fn interface{}) error {
-				return test.registerHandlerResult
-			},
-			fnSubscribe: func(event string) error {
-				return test.subscribeResult
-			},
-			fnExec: func(src string, output bool) (string, error) {
-				return "", test.execResult
-			},
-		}
-		b := &buffers{}
-		err := prepareEnv(client, b)
-		if test.wants != nil && *test.wants != strings.TrimRight(err.Error(), "\n") {
-			t.Fatalf("expect `%s` but `%s`", *test.wants, err)
-		}
-		if test.wants == nil && err != nil {
-			t.Fatal(err)
-		}
+	for i, test := range tests {
+		test := test
+		t.Run(fmt.Sprintf("%d", i), func(t *testing.T) {
+			wg := &sync.WaitGroup{}
+			bufwg := &sync.WaitGroup{}
+
+			client := &testClient{
+				fnRegisterHandler: func(method string, fn any) error {
+					return test.registerHandlerResult
+				},
+				fnSubscribe: func(event string) error {
+					return test.subscribeResult
+				},
+			}
+			err := prepareEnv(t.Context(), wg, client, bufwg)
+			if test.wants != nil && *test.wants != strings.TrimRight(err.Error(), "\n") {
+				t.Fatalf("expect `%s` but `%s`", *test.wants, err)
+			}
+			if test.wants == nil && err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -219,12 +185,11 @@ func TestTabnewWithPty(t *testing.T) {
 		},
 	}
 
-	buf, err := tabnew(client, pty)
-	if err != nil {
+	wg := &sync.WaitGroup{}
+	bufwg := &sync.WaitGroup{}
+
+	if err := tabnew(t.Context(), wg, client, pty, bufwg); err != nil {
 		t.Fatal(err)
-	}
-	if *buf != nvim.Buffer(128) {
-		t.Fatalf("not excepted: %v", buf)
 	}
 }
 
@@ -247,11 +212,10 @@ func TestTabnewWithoutPty(t *testing.T) {
 		},
 	}
 
-	buf, err := tabnew(client, stdin.File)
-	if err != nil {
+	wg := &sync.WaitGroup{}
+	bufwg := &sync.WaitGroup{}
+
+	if err := tabnew(t.Context(), wg, client, stdin.File, bufwg); err != nil {
 		t.Fatal(err)
-	}
-	if *buf != nvim.Buffer(128) {
-		t.Fatalf("not excepted: %v", buf)
 	}
 }
