@@ -79,12 +79,18 @@ func prepareEnv(cx context.Context, wg *sync.WaitGroup, client nvimClient, bufwg
 func registerCloseNotify(cx context.Context, wg *sync.WaitGroup, client nvimClient, bufwg *sync.WaitGroup) error {
 	cid := client.ChannelID()
 
+	buf, err := client.CurrentBuffer()
+	if err != nil {
+		return fmt.Errorf("failed to get current buffer: %w", err)
+	}
+
+	// FIXME notify bufnr
 	code := fmt.Sprintf(`return vim.api.nvim_create_autocmd('BufWinLeave', {
-  buffer = bufnr,
+  buffer = %d,
   callback = function(e)
     vim.rpcnotify(%d, 'renvimExit')
   end,
-})`, cid)
+})`, buf, cid)
 
 	var id int
 	var args struct{}
